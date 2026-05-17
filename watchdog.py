@@ -69,7 +69,6 @@ def tg(text: str):
 
 def main():
     log.info("Railway Watchdog запущен (второй слой защиты после Cloudflare).")
-    tg("🐕 <b>Railway Watchdog запущен.</b> Слежу за Силли каждые 2 минуты.")
 
     fail_count = 0
     in_redeploy = False
