@@ -24,9 +24,11 @@ log = logging.getLogger(__name__)
 
 
 def check_health() -> bool:
+    """Любой HTTP ответ = Силли жива. Упала = timeout или connection error."""
     try:
-        r = requests.get(f"{SILLI_URL}/health", timeout=10)
-        return r.status_code == 200
+        r = requests.get(f"{SILLI_URL}/task", timeout=10)
+        # 405 Method Not Allowed — endpoint есть, Силли жива
+        return r.status_code < 500
     except Exception as e:
         log.warning(f"Health check exception: {e}")
         return False
