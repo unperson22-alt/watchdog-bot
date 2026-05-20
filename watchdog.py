@@ -98,7 +98,12 @@ def main():
                     time.sleep(REDEPLOY_COOLDOWN)
                     continue
                 else:
-                    tg("🔴 <b>Railway API недоступен.</b> Cloudflare Watchdog должен уведомить отдельно.")
+                    tg("🔴 <b>Railway API недоступен.</b> Жду 30 минут перед следующей попыткой.")
+                    in_redeploy = True   # заглушаем спам
+                    fail_count = 0
+                    time.sleep(1800)     # 30 минут тишины
+                    in_redeploy = False  # снова мониторим
+                    continue
 
         time.sleep(CHECK_INTERVAL)
 
