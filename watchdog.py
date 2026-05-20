@@ -56,6 +56,35 @@ def redeploy_silli() -> bool:
         return False
 
 
+
+PLATFORM_OUTAGE_SILENCE = 1800  # 30 мин тишины после обнаружения outage
+_platform_outage_alerted = False  # уже отправили алерт об outage
+_platform_outage_until   = 0      # молчим до этого timestamp
+
+
+def check_railway_platform_status() -> str:
+    """
+    Проверяет https://status.railway.app/api/v2/status.json
+    Возвращает: "ok" | "incident" | "major_outage" | "unknown"
+    Timeout 8 сек — не блокируем основной цикл надолго.
+    """
+    try:
+        r = requests.get("https://status.railway.app/api/v2/status.json", timeout=8)
+        if r.status_code != 200:
+            return "unknown"
+        data = r.json()
+        indicator = data.get("status", {}).get("indicator", "none").lower()
+        # Cloudflare statuspage: none / minor / major / critical
+        if indicator in ("major", "critical"):
+            return "major_outage"
+        if indicator in ("minor",):
+            return "incident"
+        return "ok"
+    except Exception as e:
+        log.warning(f"Platform status check failed: {e}")
+        return "unknown"
+
+
 def tg(text: str):
     try:
         requests.post(
@@ -72,6 +101,8 @@ def main():
 
     fail_count = 0
     in_redeploy = False
+    platform_outage_alerted = False
+    platform_outage_until   = 0
 
     while True:
         healthy = check_health()
@@ -88,6 +119,31 @@ def main():
             log.warning(f"Силли не отвечает. Fail {fail_count}/{FAIL_THRESHOLD}")
 
             if fail_count >= FAIL_THRESHOLD and not in_redeploy:
+                # ── Platform outage detection ─────────────────────────────
+                # Перед алертом проверяем status.railway.app
+                # Major Outage → один алерт + тишина 30 мин (не спамим)
+                now = time.time()
+                if now < platform_outage_until:
+                    # Ещё в периоде молчания после outage — пропускаем
+                    log.info(f"Platform outage silence active, skipping alert")
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+
+                platform_status = check_railway_platform_status()
+                log.info(f"Platform status: {platform_status}")
+
+                if platform_status == "major_outage":
+                    if not platform_outage_alerted:
+                        tg("🌐 <b>Railway Platform Outage</b> — глобальный сбой на стороне Railway. Силли не отвечает из-за этого. Жду восстановления, алертов не будет.")
+                        platform_outage_alerted = True
+                    platform_outage_until = now + PLATFORM_OUTAGE_SILENCE
+                    fail_count = 0
+                    time.sleep(PLATFORM_OUTAGE_SILENCE)
+                    platform_outage_alerted = False  # сбрасываем чтобы алертнуть если повторится
+                    continue
+
+                # Платформа ок (или unknown) — обычный алерт и редеплой
+                platform_outage_alerted = False
                 log.error("Порог достигнут. Запускаю редеплой...")
                 tg(f"⚠️ <b>Railway Watchdog:</b> Силли не отвечает {fail_count} раза подряд. Редеплой...")
 
