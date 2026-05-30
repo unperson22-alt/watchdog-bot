@@ -103,6 +103,7 @@ def main():
     in_redeploy = False
     platform_outage_alerted = False
     platform_outage_until   = 0
+    api_fail_count = 0  # счётчик Railway API failures — не спамим
 
     while True:
         healthy = check_health()
@@ -113,6 +114,7 @@ def main():
                 tg("✅ <b>Силли восстановилась</b> (Railway Watchdog)")
                 in_redeploy = False
             fail_count = 0
+            api_fail_count = 0  # сбрасываем при восстановлении
             log.info("OK")
         else:
             fail_count += 1
@@ -154,10 +156,13 @@ def main():
                     time.sleep(REDEPLOY_COOLDOWN)
                     continue
                 else:
-                    tg("🔴 <b>Railway API недоступен.</b> Жду 30 минут перед следующей попыткой.")
-                    in_redeploy = True   # заглушаем спам
+                    api_fail_count += 1
+                    if api_fail_count <= 1:
+                        tg("🔴 <b>Railway API недоступен.</b> Нужно ручное вмешательство.")
+                    # После первого алерта — молчим 6 часов, не повторяем
+                    in_redeploy = True
                     fail_count = 0
-                    time.sleep(1800)     # 30 минут тишины
+                    time.sleep(21600)    # 6 часов тишины вместо 30 мин цикла
                     in_redeploy = False  # снова мониторим
                     continue
 
