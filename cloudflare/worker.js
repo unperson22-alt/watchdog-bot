@@ -1,8 +1,8 @@
 // Cloudflare Watchdog для AI Office — мониторит Силли каждые 5 минут
 // Живёт на Cloudflare, не зависит от Railway вообще
 
-const SILLI_URL        = "https://cilly-bot-production.up.railway.app/health";
-const SILLI_SERVICE_ID = "efa6bd21-91d8-467f-8250-60f8a3853791";
+const SILLI_URL        = "https://ai-office-shared-production.up.railway.app/health";
+const SILLI_SERVICE_ID = "95999005-f1a9-4ce9-9cee-7e803394e14e";
 const SILLI_ENV_ID     = "2efaaf60-ba39-492c-bf86-007fd505493f";
 const TG_CHAT_ID       = "-5194783850";
 const FAIL_THRESHOLD   = 2; // 2 проверки = 10 минут при cron */5
