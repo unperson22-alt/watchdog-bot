@@ -4,7 +4,7 @@ import logging
 import requests
 
 # --- Config from env ---
-SILLI_URL        = os.environ["SILLI_URL"].rstrip("/")
+SILLI_URL        = os.environ.get("SILLI_URL", "https://ai-office-shared-production.up.railway.app").rstrip("/")
 RAILWAY_TOKEN    = os.environ["RAILWAY_TOKEN"]
 SILLI_SERVICE_ID = os.environ["SILLI_SERVICE_ID"]
 SILLI_ENV_ID     = os.environ["SILLI_ENV_ID"]
