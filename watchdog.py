@@ -2,6 +2,7 @@ import os
 import time
 import logging
 import requests
+import json
 
 # --- Config from env ---
 SILLI_URL        = os.environ.get("SILLI_URL", "https://ai-office-shared-production.up.railway.app").rstrip("/")
@@ -96,6 +97,22 @@ def tg(text: str):
         log.warning(f"Telegram send failed: {e}")
 
 
+def notify_team(message: str) -> bool:
+    """Уведомляет команду разработки (Девви) что лидер упал и нужна починка."""
+    try:
+        devvy_url = os.environ.get("DEVVY_URL", "https://devvy-bot-production-9a4f.up.railway.app")
+        resp = requests.post(
+            f"{devvy_url}/task",
+            json={"message": message, "user_id": 391077101},
+            timeout=15
+        )
+        log.info(f"Team notified: {resp.status_code}")
+        return resp.status_code == 200
+    except Exception as e:
+        log.warning(f"Team notify failed: {e}")
+        return False
+
+
 def main():
     log.info("Railway Watchdog запущен (второй слой защиты после Cloudflare).")
 
@@ -154,6 +171,28 @@ def main():
                     in_redeploy = True
                     fail_count = 0
                     time.sleep(REDEPLOY_COOLDOWN)
+                    # Проверяем восстановилась ли Силли после редеплоя
+                    recovered = check_health()
+                    if recovered:
+                        log.info("Силли восстановилась после редеплоя")
+                        tg("✅ <b>Силли восстановилась</b> после редеплоя.")
+                        in_redeploy = False
+                    else:
+                        # Редеплой не помог — код сломан, нужна команда
+                        log.error("Силли не восстановилась после редеплоя — код сломан")
+                        tg(
+                            "🔴 <b>Силли не восстановилась после редеплоя.</b>\n"
+                            "Вероятно сломан код. Уведомляю команду..."
+                        )
+                        team_msg = (
+                            "СРОЧНО: Силли (ai-office-shared) упала и не восстановилась после редеплоя. "
+                            "Код сломан. Нужно: 1) прочитать логи Railway сервиса ai-office-shared, "
+                            "2) найти причину краша в agents/coder.py, "
+                            "3) исправить и задеплоить. "
+                            "Railway service: 95999005-f1a9-4ce9-9cee-7e803394e14e, "
+                            "project: dev-dept (30a933d1-689f-4709-a12c-a36a49aa1820)."
+                        )
+                        notify_team(team_msg)
                     continue
                 else:
                     api_fail_count += 1
