@@ -5,7 +5,8 @@ const SILLI_URL        = "https://ai-office-shared-production.up.railway.app/hea
 const SILLI_SERVICE_ID = "95999005-f1a9-4ce9-9cee-7e803394e14e";
 const SILLI_ENV_ID     = "2efaaf60-ba39-492c-bf86-007fd505493f";
 const TG_CHAT_ID       = "-5194783850";
-const FAIL_THRESHOLD   = 2; // 2 проверки = 10 минут при cron */5
+const FAIL_THRESHOLD        = 5;  // 5 проверок = 25 минут — редеплой
+const FAIL_ALERT_THRESHOLD  = 2;  // 2-4 проверки = тихо, без алерта
 
 // KV ключи (персистентные между запусками)
 const K_FAILS       = "watchdog:fail_count";
@@ -72,9 +73,14 @@ export default {
     await kv.put(K_FAILS, String(fails));
     const alreadyRedeploying = (await kv.get(K_REDEPLOYING)) === "1";
 
+    // Тихий лог при 2-4 fail — без алерта в группу
+    if (fails >= FAIL_ALERT_THRESHOLD && fails < FAIL_THRESHOLD && !alreadyRedeploying) {
+      return; // кратковременный провал — ждём
+    }
+
     if (fails >= FAIL_THRESHOLD && !alreadyRedeploying) {
       await tg(env,
-        `⚠️ <b>Силли не отвечает</b> ${fails} проверки подряд (~${fails * 5} мин).\n` +
+        `⚠️ <b>Силли не отвечает</b> ${fails} проверок подряд (~${fails * 5} мин).\n` +
         `Запускаю редеплой через Railway API...`
       );
 
