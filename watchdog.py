@@ -12,11 +12,12 @@ SILLI_ENV_ID     = os.environ["SILLI_ENV_ID"]
 BOT_TOKEN        = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID          = os.environ["TELEGRAM_CHAT_ID"]
 
-# Трейдер (tilly-trader) — второй сторожимый сервис. SERVICE_ID/ENV_ID опциональны:
-# без них контур работает в режиме «только алерт» (без авто-редеплоя).
+# Трейдер (tilly-trader) — второй сторожимый сервис. Railway service/env заданы
+# дефолтами (как в офисном coder.py: SERVICES/SERVICE_ENV) — авто-редеплой работает
+# из коробки; env-переменные при необходимости их переопределяют.
 TRADER_URL        = os.environ.get("TRADER_URL", "https://tilly-trader-production.up.railway.app").rstrip("/")
-TRADER_SERVICE_ID = os.environ.get("TRADER_SERVICE_ID", "")
-TRADER_ENV_ID     = os.environ.get("TRADER_ENV_ID", "")
+TRADER_SERVICE_ID = os.environ.get("TRADER_SERVICE_ID", "1c08bbcc-32bb-4e91-9bc9-d196c937c1c4")
+TRADER_ENV_ID     = os.environ.get("TRADER_ENV_ID", "7ff2ff7a-b6d7-4c06-95c9-9958f0d3af7b")
 
 CHECK_INTERVAL        = 120   # секунд между проверками
 FAIL_THRESHOLD        = 2     # фейлов подряд до редеплоя (Силли)
