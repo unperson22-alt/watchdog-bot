@@ -12,9 +12,16 @@ SILLI_ENV_ID     = os.environ["SILLI_ENV_ID"]
 BOT_TOKEN        = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID          = os.environ["TELEGRAM_CHAT_ID"]
 
-CHECK_INTERVAL    = 120   # секунд между проверками
-FAIL_THRESHOLD    = 2     # фейлов подряд до редеплоя
-REDEPLOY_COOLDOWN = 300   # секунд паузы после редеплоя
+# Трейдер (tilly-trader) — второй сторожимый сервис. SERVICE_ID/ENV_ID опциональны:
+# без них контур работает в режиме «только алерт» (без авто-редеплоя).
+TRADER_URL        = os.environ.get("TRADER_URL", "https://tilly-trader-production.up.railway.app").rstrip("/")
+TRADER_SERVICE_ID = os.environ.get("TRADER_SERVICE_ID", "")
+TRADER_ENV_ID     = os.environ.get("TRADER_ENV_ID", "")
+
+CHECK_INTERVAL        = 120   # секунд между проверками
+FAIL_THRESHOLD        = 2     # фейлов подряд до редеплоя (Силли)
+TRADER_FAIL_THRESHOLD = 3     # деградаций подряд до реакции (трейдер); ~6 мин при 120с
+REDEPLOY_COOLDOWN     = 300   # секунд паузы после редеплоя
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,7 +41,7 @@ def check_health() -> bool:
         return False
 
 
-def redeploy_silli() -> bool:
+def redeploy_service(service_id: str, env_id: str) -> bool:
     mutation = """
     mutation serviceInstanceRedeploy($serviceId: String!, $environmentId: String!) {
         serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId)
@@ -44,8 +51,8 @@ def redeploy_silli() -> bool:
         resp = requests.post(
             "https://backboard.railway.com/graphql/v2",
             json={"query": mutation, "variables": {
-                "serviceId": SILLI_SERVICE_ID,
-                "environmentId": SILLI_ENV_ID
+                "serviceId": service_id,
+                "environmentId": env_id
             }},
             headers={"Authorization": f"Bearer {RAILWAY_TOKEN}", "Content-Type": "application/json"},
             timeout=30
@@ -55,6 +62,31 @@ def redeploy_silli() -> bool:
     except Exception as e:
         log.error(f"Redeploy request failed: {e}")
         return False
+
+
+def redeploy_silli() -> bool:
+    return redeploy_service(SILLI_SERVICE_ID, SILLI_ENV_ID)
+
+
+def check_trader() -> tuple:
+    """GET трейдер /health. Возвращает (ok, reason).
+
+    Трейдер теперь отдаёт 503 при деградации (stale-скан / выключенный скринер) и
+    кладёт причину в тело — раньше /health всегда был 200 и стоп сканера был невидим.
+    """
+    try:
+        r = requests.get(f"{TRADER_URL}/health", timeout=10)
+        if r.status_code == 200:
+            return True, None
+        reason = str(r.status_code)
+        try:
+            b = r.json()
+            reason = b.get("reason") or b.get("status") or reason
+        except Exception:
+            pass
+        return False, reason
+    except Exception as e:
+        return False, f"timeout:{type(e).__name__}"
 
 
 
@@ -121,6 +153,9 @@ def main():
     platform_outage_alerted = False
     platform_outage_until   = 0
     api_fail_count = 0  # счётчик Railway API failures — не спамим
+
+    trader_fail = 0
+    trader_in_redeploy = False  # «реакция уже была» — молчим до восстановления
 
     while True:
         healthy = check_health()
@@ -204,6 +239,41 @@ def main():
                     time.sleep(21600)    # 6 часов тишины вместо 30 мин цикла
                     in_redeploy = False  # снова мониторим
                     continue
+
+        # ── Трейдер (tilly-trader): отдельный лёгкий контур ───────────────
+        # Цель — поймать «молчание» сканера, которое раньше было невидимым:
+        # screener_disabled (нет TRADING_CHANNEL_ID) или scan_stale (скан завис).
+        t_ok, t_reason = check_trader()
+        if t_ok:
+            if trader_in_redeploy:
+                tg("✅ <b>Трейдер восстановился</b> (Railway Watchdog)")
+                trader_in_redeploy = False
+            trader_fail = 0
+        else:
+            trader_fail += 1
+            log.warning(f"Трейдер degraded ({t_reason}). Fail {trader_fail}/{TRADER_FAIL_THRESHOLD}")
+            if trader_fail >= TRADER_FAIL_THRESHOLD and not trader_in_redeploy:
+                if t_reason == "screener_disabled":
+                    # Конфиг (нет TRADING_CHANNEL_ID) — редеплой НЕ поможет, нужна команда.
+                    tg("🛑 <b>Трейдер: скринер ВЫКЛЮЧЕН</b> (screener_disabled).\n"
+                       "Сигналы не идут. Нужен TRADING_CHANNEL_ID в env — редеплой не починит.")
+                    notify_team(
+                        "Трейдер tilly-trader: /health=screener_disabled — не задан "
+                        "TRADING_CHANNEL_ID, сигналы не идут вообще. Проверь env на Railway."
+                    )
+                elif TRADER_SERVICE_ID and TRADER_ENV_ID:
+                    tg(f"⚠️ <b>Трейдер деградировал</b> ({t_reason}) ×{trader_fail}. Редеплой...")
+                    if redeploy_service(TRADER_SERVICE_ID, TRADER_ENV_ID):
+                        tg("🚀 Редеплой трейдера запущен.")
+                    else:
+                        tg("🔴 Редеплой трейдера не удался (Railway API).")
+                else:
+                    # Авто-редеплой выключен (нет TRADER_SERVICE_ID) — режим «только алерт».
+                    tg(f"⚠️ <b>Трейдер деградировал</b> ({t_reason}) ×{trader_fail}.\n"
+                       "Авто-редеплой выключен (нет TRADER_SERVICE_ID) — нужен ручной разбор.")
+                    notify_team(f"Трейдер tilly-trader /health degraded: {t_reason}. Проверь логи и /health.")
+                trader_in_redeploy = True  # молчим до восстановления
+                trader_fail = 0
 
         time.sleep(CHECK_INTERVAL)
 
