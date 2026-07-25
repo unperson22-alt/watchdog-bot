@@ -2,7 +2,6 @@ import os
 import time
 import logging
 import requests
-import json
 
 # --- Config from env ---
 SILLI_URL        = os.environ.get("SILLI_URL", "https://ai-office-shared-production.up.railway.app").rstrip("/")
@@ -180,7 +179,7 @@ def main():
                 now = time.time()
                 if now < platform_outage_until:
                     # Ещё в периоде молчания после outage — пропускаем
-                    log.info(f"Platform outage silence active, skipping alert")
+                    log.info("Platform outage silence active, skipping alert")
                     time.sleep(CHECK_INTERVAL)
                     continue
 
