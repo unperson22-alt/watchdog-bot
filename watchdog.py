@@ -64,6 +64,111 @@ def redeploy_service(service_id: str, env_id: str) -> bool:
         return False
 
 
+def railway(query: str, variables: dict = None) -> dict:
+    """Один вход в Railway GraphQL. Возвращает {} при любой сетевой беде."""
+    try:
+        resp = requests.post(
+            "https://backboard.railway.com/graphql/v2",
+            json={"query": query, "variables": variables or {}},
+            headers={"Authorization": f"Bearer {RAILWAY_TOKEN}",
+                     "Content-Type": "application/json"},
+            timeout=30,
+        )
+        return resp.json() or {}
+    except Exception as e:
+        log.error(f"Railway request failed: {e}")
+        return {}
+
+
+# ── Последний ЗДОРОВЫЙ деплой ───────────────────────────────────────────────
+# ЗАЧЕМ: сторож умел ровно один приём — serviceInstanceRedeploy, а он
+# пересобирает ТОТ ЖЕ коммит. Если Силли легла из-за сломанного кода (инцидент
+# 01.07: файл на 5766 строк заменился заглушкой на 8 и уехал в прод), редеплой
+# честно поднимает ту же заглушку и снова падает. Отсюда и тупик «редеплой не
+# помог» — сторож не мог вернуть офис в рабочее состояние в принципе.
+#
+# ПОЧЕМУ «здоровый», а не «SUCCESS»: статус деплоя говорит, что СБОРКА удалась.
+# Процесс при этом может падать на импорте. Единственное честное доказательство
+# работоспособности — что /health отвечал ПОСЛЕ этого деплоя, и знает об этом
+# только сторож, потому что он единственный, кто это проверяет.
+LAST_GOOD_FILE   = os.environ.get("LAST_GOOD_FILE", "/tmp/watchdog_last_good")
+GOOD_REFRESH_EVERY = 10          # циклов между обновлениями отметки (~20 мин)
+DEPLOY_GRACE_SEC   = 240         # сколько даём новому деплою подняться
+
+
+def current_deployment(service_id: str) -> dict:
+    """Текущий (самый свежий) деплой сервиса: {id, status} или {}."""
+    data = railway(
+        "query($sid:String!){deployments(first:1,input:{serviceId:$sid})"
+        "{edges{node{id status}}}}",
+        {"sid": service_id})
+    edges = (((data.get("data") or {}).get("deployments") or {}).get("edges") or [])
+    return edges[0]["node"] if edges else {}
+
+
+def remember_good(deployment_id: str) -> None:
+    """Запомнить деплой, при котором /health реально отвечал."""
+    if not deployment_id:
+        return
+    try:
+        with open(LAST_GOOD_FILE, "w") as f:
+            f.write(deployment_id)
+    except Exception as e:
+        log.warning(f"Не смог записать отметку последнего здорового деплоя: {e}")
+
+
+def load_last_good() -> str:
+    """Отметка с диска. Пусто — значит сторож ещё не видел Силли живой."""
+    try:
+        with open(LAST_GOOD_FILE) as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def rollback_to(deployment_id: str) -> bool:
+    """
+    Откатить сервис на конкретный деплой.
+
+    Пробуем deploymentRollback, при отказе — deploymentRedeploy. Обе мутации
+    есть в схеме Railway (проверено интроспекцией), но сигнатуры со временем
+    менялись; ошибка валидации GraphQL приходит ДО любого эффекта, поэтому
+    вторая попытка безопасна. Зовётся только когда Силли уже лежит и обычный
+    редеплой не помог — не сделать ничего здесь хуже, чем попробовать оба.
+    """
+    for mutation, field in (
+        ("mutation($id:String!){deploymentRollback(id:$id)}", "deploymentRollback"),
+        ("mutation($id:String!){deploymentRedeploy(id:$id)}", "deploymentRedeploy"),
+    ):
+        data = railway(mutation, {"id": deployment_id})
+        if data and not data.get("errors"):
+            log.info(f"Откат выполнен через {field}")
+            return True
+        log.warning(f"{field} не сработал: {str(data.get('errors'))[:200]}")
+    return False
+
+
+def rollback_silli_to_last_good() -> str:
+    """
+    Вернуть Силли на последний деплой, при котором она была ЖИВА.
+
+    Возвращает человеко-читаемый итог для алерта — сторож обязан говорить, что
+    именно он сделал, иначе автоматическое действие неотличимо от случайности.
+    """
+    good = load_last_good()
+    if not good:
+        return "откатывать некуда: сторож ещё не видел Силли здоровой"
+    cur = current_deployment(SILLI_SERVICE_ID)
+    if cur.get("id") == good:
+        return f"откат бессмысленен: сейчас и так развёрнут {good[:8]} (он и был здоровым)"
+    if not rollback_to(good):
+        return f"откат на {good[:8]} НЕ прошёл — Railway отклонил обе мутации"
+    time.sleep(DEPLOY_GRACE_SEC)
+    if check_health():
+        return f"откат на {good[:8]} помог — Силли отвечает"
+    return f"откат на {good[:8]} прошёл, но /health молчит — проблема не в коде Силли"
+
+
 def redeploy_silli() -> bool:
     return redeploy_service(SILLI_SERVICE_ID, SILLI_ENV_ID)
 
@@ -130,18 +235,40 @@ def tg(text: str):
 
 
 def notify_team(message: str) -> bool:
-    """Уведомляет команду разработки (Девви) что лидер упал и нужна починка."""
+    """
+    Позвать dev-отдел чинить лидера.
+
+    Раньше это был POST в никуда: код ответа писался в лог, `source` не
+    ставился, а если Девви тоже лежал — сообщение просто исчезало. Тот же
+    класс, что и молчаливый отказ вайтлиста: сбой без следа не отлаживается,
+    а здесь он ещё и означал, что чинить Силли не придёт вообще никто.
+
+    Теперь: проверяем ответ, и о неудаче докладываем в Telegram — там сидит
+    человек, и он последняя инстанция, когда лежат и лидер, и команда.
+
+    Доска задач сюда сознательно НЕ подключена: у сторожа нет REDIS_URL, а
+    выдавать ему доступ к общей памяти ради одной записи — расширять права
+    компонента, вся ценность которого в том, что он маленький и переживает
+    смерть остальных.
+    """
+    devvy_url = os.environ.get("DEVVY_URL", "https://devvy-bot-production-9a4f.up.railway.app")
     try:
-        devvy_url = os.environ.get("DEVVY_URL", "https://devvy-bot-production-9a4f.up.railway.app")
         resp = requests.post(
             f"{devvy_url}/task",
-            json={"message": message, "user_id": 391077101},
-            timeout=15
+            json={"message": message, "user_id": 391077101, "source": "WATCHDOG",
+                  "sender": "ВАЧДОГ"},
+            timeout=15,
         )
+        ok = resp.status_code in (200, 202)
         log.info(f"Team notified: {resp.status_code}")
-        return resp.status_code == 200
+        if not ok:
+            tg(f"🔴 <b>Dev-отдел не принял задачу</b> (Девви ответил {resp.status_code}).\n"
+               f"Силли лежит, команда недоступна — нужен ты, шеф.")
+        return ok
     except Exception as e:
         log.warning(f"Team notify failed: {e}")
+        tg(f"🔴 <b>Dev-отдел недоступен</b> ({type(e).__name__}).\n"
+           f"Силли лежит и позвать команду не получилось — нужен ты, шеф.")
         return False
 
 
@@ -157,6 +284,9 @@ def main():
     trader_fail = 0
     trader_in_redeploy = False  # «реакция уже была» — молчим до восстановления
 
+    good_tick = 0        # счётчик здоровых циклов до обновления отметки
+    seen_deploy = ""     # последний ВИДЕННЫЙ деплой — чтобы заметить новый выкат
+
     while True:
         healthy = check_health()
 
@@ -168,6 +298,21 @@ def main():
             fail_count = 0
             api_fail_count = 0  # сбрасываем при восстановлении
             log.info("OK")
+
+            # Отметка «этот деплой точно рабочий». Раз в GOOD_REFRESH_EVERY
+            # циклов, а не каждый — иначе сторож молотит Railway API впустую.
+            good_tick += 1
+            if good_tick >= GOOD_REFRESH_EVERY or not seen_deploy:
+                good_tick = 0
+                cur = current_deployment(SILLI_SERVICE_ID)
+                cur_id = cur.get("id", "")
+                if cur_id:
+                    if seen_deploy and cur_id != seen_deploy:
+                        # Приехал новый выкат и Силли после него жива — это и
+                        # есть успешная доставка. Отдельно сообщать не о чем.
+                        log.info(f"Новый деплой {cur_id[:8]} здоров")
+                    seen_deploy = cur_id
+                    remember_good(cur_id)
         else:
             fail_count += 1
             log.warning(f"Силли не отвечает. Fail {fail_count}/{FAIL_THRESHOLD}")
@@ -219,6 +364,19 @@ def main():
                             "🔴 <b>Силли не восстановилась после редеплоя.</b>\n"
                             "Вероятно сломан код. Уведомляю команду..."
                         )
+                        # Курьер обязан уметь отыграть назад. Раньше здесь
+                        # был тупик: редеплой пересобрал тот же сломанный
+                        # коммит, значит и второй раз упадёт. Сначала возвращаем
+                        # офис в рабочее состояние, и только потом зовём людей —
+                        # чинить сломанное приятнее, когда прод уже жив.
+                        verdict = rollback_silli_to_last_good()
+                        log.warning(f"Откат: {verdict}")
+                        tg(f"↩️ <b>Откат Силли:</b> {verdict}")
+                        if check_health():
+                            in_redeploy = False
+                            fail_count = 0
+                            seen_deploy = current_deployment(SILLI_SERVICE_ID).get("id", "")
+
                         team_msg = (
                             "СРОЧНО: Силли (ai-office-shared) упала и не восстановилась после редеплоя. "
                             "Код сломан. Нужно: 1) прочитать логи Railway сервиса ai-office-shared, "
