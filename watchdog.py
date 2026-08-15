@@ -272,8 +272,71 @@ def notify_team(message: str) -> bool:
         return False
 
 
+def preflight_service(service_id: str, label: str) -> bool:
+    """
+    Проверить, что сторожимый сервис вообще существует на Railway.
+
+    16.08.2026: выяснилось, что SILLI_SERVICE_ID указывает на сервис с
+    deletedAt = 2026-05-30 — serviceInstances пуст, деплоев ноль. То есть с
+    конца мая каждый редеплой уходил в удалённую запись, current_deployment
+    возвращал {}, отметка последнего здорового деплоя не ставилась ни разу, а
+    значит и откат был невозможен. Сторож при этом рапортовал штатно: пустой
+    ответ обрабатывался как «нечего запоминать» и в лог не попадал.
+
+    Мёртвый идентификатор снаружи неотличим от рабочего, пока не случится
+    авария — а в аварию как раз и выясняется, что сторожа нет. Поэтому
+    спрашиваем один раз на старте и, если сервиса нет, говорим об этом
+    человеку: сам сторож эту переменную починить не может.
+    """
+    if not service_id:
+        tg(f"🔴 <b>Сторож без цели</b>: не задан id сервиса «{label}». "
+           f"Автоподъём не работает.")
+        return False
+
+    # Три исхода, и путать их нельзя. «Railway не ответил» — не улика против
+    # переменной: обвинить её из-за сетевой моргалки значит послать человека
+    # чинить исправное. Поэтому недоступность API сначала пережидаем, а если
+    # так и не ответил — говорим именно это, а не «сервис не найден».
+    data = {}
+    for attempt in range(3):
+        data = railway("query($sid:String!){service(id:$sid){name deletedAt}}",
+                       {"sid": service_id})
+        if data.get("data") is not None:
+            break
+        if attempt < 2:
+            time.sleep(5 * (attempt + 1))
+    if data.get("data") is None:
+        log.error(f"[preflight] {label}: Railway API не ответил, проверить не смог")
+        tg(f"⚠️ <b>Сторож не смог проверить цель</b>: Railway API не ответил "
+           f"на запрос о сервисе «{label}». Слежу дальше, но подтвердить, что "
+           f"редеплой сработает, не могу.")
+        return False
+
+    svc = data["data"].get("service")
+    if not svc:
+        log.error(f"[preflight] {label}: сервис {service_id[:8]}… не найден")
+        tg(f"🔴 <b>Сторож целится в никуда</b>: сервис «{label}» "
+           f"({service_id[:8]}…) не найден на Railway. Автоподъём не работает "
+           f"— проверь переменную, шеф.")
+        return False
+    if svc.get("deletedAt"):
+        log.error(f"[preflight] {label}: сервис удалён {svc['deletedAt']}")
+        tg(f"🔴 <b>Сторож целится в удалённый сервис</b>: «{label}» "
+           f"({service_id[:8]}…) удалён {str(svc['deletedAt'])[:10]}.\n"
+           f"Редеплой и откат не сработают. Возьми настоящий id в Railway UI "
+           f"и положи в переменную, шеф.")
+        return False
+    log.info(f"[preflight] {label}: сервис «{svc.get('name', '?')}» на месте")
+    return True
+
+
 def main():
     log.info("Railway Watchdog запущен (второй слой защиты после Cloudflare).")
+
+    # Проверяем цель ДО первого цикла: сторож, который не может дотянуться до
+    # сторожимого, обязан сказать об этом сразу, а не в момент аварии.
+    preflight_service(SILLI_SERVICE_ID, "Силли")
+    preflight_service(TRADER_SERVICE_ID, "Трейдер")
 
     fail_count = 0
     in_redeploy = False
@@ -313,6 +376,14 @@ def main():
                         log.info(f"Новый деплой {cur_id[:8]} здоров")
                     seen_deploy = cur_id
                     remember_good(cur_id)
+                else:
+                    # Силли отвечает на /health, но деплоев у сервиса нет —
+                    # значит опрашиваем не тот сервис. Ровно так выглядел
+                    # мёртвый SILLI_SERVICE_ID с 30.05: ветка молча ничего не
+                    # делала, отметка здорового деплоя не ставилась ни разу,
+                    # и откатывать в аварию было не на что.
+                    log.error("Сервис жив по /health, но деплоев у него нет "
+                              "— id почти наверняка чужой или удалён")
         else:
             fail_count += 1
             log.warning(f"Силли не отвечает. Fail {fail_count}/{FAIL_THRESHOLD}")
